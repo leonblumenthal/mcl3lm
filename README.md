@@ -1,4 +1,4 @@
-# MCL3LM
+# Monocular Camera Localization in 3D LiDAR Maps
 This is an implementation of the paper "Monocular Camera Localization in 3D LiDAR Maps" [1] using C++ and Python. 
 
 
