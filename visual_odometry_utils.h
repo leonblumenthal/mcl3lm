@@ -20,59 +20,6 @@
 #include <vector>
 #include "camera.h"
 
-
-
-
-// TODO:
-// Find inliers with known poses using the epipolar constraint.
-std::pair<std::vector<std::pair<int, int>>, std::vector<Eigen::Vector3d>> find_inliers_essential(
-    const std::vector<Eigen::Vector2i> &corners_1,
-    const std::vector<Eigen::Vector2i> &corners_2,
-    const std::vector<std::pair<int, int>> &matches,
-    const Sophus::SE3d &pose_1,
-    const Sophus::SE3d &pose_2,
-    const Camera<> &camera,
-    const double max_epipolar_error = 1e-3
-) {
-  // Compute essential matrix.
-  Sophus::SE3d pose_1_2 = pose_1.inverse() * pose_2;
-  const Eigen::Vector3d t = pose_1_2.translation() / pose_1_2.translation().norm();
-  Eigen::Matrix3d t_hat;
-  t_hat << 0, -t(2), t(1), t(2), 0, -t(0), -t(1), t(0), 0;
-  Eigen::Matrix3d E{t_hat * pose_1_2.rotationMatrix()};
-
-  opengv::bearingVectors_t bearing_vectors_1;
-  opengv::bearingVectors_t bearing_vectors_2;
-
-  std::vector<std::pair<int, int>> inliers;
-  for (const auto &[index_1, index_2] : matches) {
-    Eigen::Vector3d unprojected_1 = camera.unproject(corners_1[index_1].cast<double>());
-    Eigen::Vector3d unprojected_2 = camera.unproject(corners_2[index_2].cast<double>());
-
-    if (unprojected_1.transpose() * E * unprojected_2 < max_epipolar_error) {
-      inliers.emplace_back(index_1, index_2);
-
-      bearing_vectors_1.push_back(unprojected_1);
-      bearing_vectors_2.push_back(unprojected_2);
-    }
-  }
-
-  opengv::relative_pose::CentralRelativeAdapter adapter(
-      bearing_vectors_1, bearing_vectors_2
-  );
-  Sophus::SE3d relative_pose = pose_1.inverse() * pose_2;
-  adapter.sett12(relative_pose.translation());
-  adapter.setR12(relative_pose.rotationMatrix());
-
-  std::vector<Eigen::Vector3d> points;
-  for (int i = 0; i < inliers.size(); ++i) {
-    points.push_back(opengv::triangulation::triangulate(adapter, i));
-  }
-
-  return {inliers, points};
-}
-
-
 using Keypoint = Eigen::Vector2i;
 using Keypoints = std::vector<Keypoint>;
 using Descriptor = std::bitset<256>;
@@ -92,6 +39,7 @@ struct Keyframe {
   Pose pose;
   Keypoints keypoints;
   Descriptors descriptors;
+  cv::Mat image;
 };
 
 struct Map {
@@ -156,7 +104,7 @@ std::vector<double> compute_angles(
   return angles;
 }
 
-std::tuple<int, int, int, int> rotate_descriptor_pattern(int bit_index, double sin_angle, double cos_angle) {
+std::tuple<int, int, int, int> rotate_descriptor_pattern(int bit_index, double cos_angle, double sin_angle) {
   int x_1 = std::round(
       cos_angle * pattern_31_x_a[bit_index] - sin_angle * pattern_31_y_a[bit_index]
   );
@@ -192,7 +140,7 @@ Descriptors compute_descriptors(
     for (int bit_index = 0; bit_index < descriptors[keypoint_index].size(); ++bit_index) {
       auto [x_1, y_1, x_2, y_2] = rotate_descriptor_pattern(bit_index, cos_angle, sin_angle);
       uint8_t intensity_1 = image.at<uint8_t>(keypoint.y() + y_1, keypoint.x() + x_1);
-      uint8_t intensity_2 = image.at<uint8_t>(keypoint.y() + y_2, keypoint.x() + x_1);
+      uint8_t intensity_2 = image.at<uint8_t>(keypoint.y() + y_2, keypoint.x() + x_2);
       descriptors[keypoint_index][bit_index] = intensity_1 < intensity_2;
     }
   }
@@ -221,7 +169,10 @@ IndexMatches match(
     const Descriptors &descriptors_1,
     const Descriptors &descriptors_2,
     int max_distance = 70,
-    double max_second_to_first_distance_ratio = 1.1
+    double max_second_to_first_distance_ratio = 1.1,
+    // TODO: Better name.
+    const std::unordered_set<int> &used_indices_1 = {},
+    const std::unordered_set<int> &used_indices_2 = {}
 ) {
 
   // 1. Compute best and second-best matches for each descriptor on both frames.
@@ -234,8 +185,12 @@ IndexMatches match(
   std::vector<Match> matches_2(descriptors_2.size());
 
   for (int index_1 = 0; index_1 < descriptors_1.size(); ++index_1) {
+    if (used_indices_1.contains(index_1)) continue;
+
     Match &match_1 = matches_1[index_1];
     for (int index_2 = 0; index_2 < descriptors_2.size(); ++index_2) {
+      if (used_indices_2.contains(index_2)) continue;
+
       Match &match_2 = matches_2[index_2];
 
       // Hamming distance.
@@ -359,23 +314,25 @@ std::pair<IndexMatches, Pose> find_inliers_ransac(
   return {inlier_matches, pose};
 }
 
+// TODO: Try out non-linear method.
 // Triangulate 3D positions from matching keypoints of two frames with a known relative pose.
 Positions triangulate(
-    const IndexMatches &matches,
-    const Keypoints &keypoints_1,
-    const Keypoints &keypoints_2,
-    const Camera<double> &camera,
-    const Pose &relative_pose
+    const IndexMatches &matches, const Keyframe &keyframe_1, const Keyframe &keyframe_2, const Camera<double> &camera
 ) {
-  auto [bearing_vectors_1, bearing_vectors_2] = compute_bearing_vectors(matches, keypoints_1, keypoints_2, camera);
+  auto [bearing_vectors_1, bearing_vectors_2] =
+      compute_bearing_vectors(matches, keyframe_1.keypoints, keyframe_2.keypoints, camera);
 
+  Pose relative_pose = keyframe_1.pose.inverse() * keyframe_2.pose;
   opengv::relative_pose::CentralRelativeAdapter adapter{
       bearing_vectors_1, bearing_vectors_2, relative_pose.translation(), relative_pose.rotationMatrix()
   };
 
   Positions positions(matches.size());
   for (int i = 0; i < matches.size(); ++i) {
+    // Relative to the pose of keyframe_1.
     positions[i] = opengv::triangulation::triangulate(adapter, i);
+    // Transform to "global" map frame.
+    positions[i] = keyframe_1.pose * positions[i];
   }
 
   return positions;
@@ -446,7 +403,7 @@ struct BundleAdjustmentReprojectionCostFunctor {
 };
 
 void bundle_adjustment(
-    Map &map, const Camera<> &camera, const int max_num_iterations = 20
+    Map &map, const Camera<> &camera, int max_num_iterations = 20
 ) {
 
   ceres::Problem problem;
@@ -487,15 +444,12 @@ void bundle_adjustment(
 IndexMatches match_landmarks(
     const Keypoints &keypoints,
     const Descriptors &descriptors,
-    const Pose &pose,
     const Map &map,
-    const Camera<> &camera,
-    const double max_image_distance = 20,
-    const double max_descriptor_distance = 70,
-    const double max_second_to_first_distance_ratio = 1.1
+    const std::unordered_map<int, Point> &landmark_points,
+    double max_image_distance = 20,
+    double max_descriptor_distance = 70,
+    double max_second_to_first_distance_ratio = 1.1
 ) {
-
-  std::unordered_map<int, Point> landmark_points = project_landmarks(map.landmarks, pose, camera);
 
   // Find closest landmark for each keypoint.
   std::unordered_map<int, int> landmark_to_keypoint;
@@ -556,15 +510,12 @@ IndexMatches match_landmarks(
 // TODO: Expose default parameters of internal methods.
 std::pair<Pose, IndexMatches> localize(
     const Keypoints &keypoints,
-    const Descriptors &descriptors,
     const Map &map,
-    const Pose &current_pose,
+    const IndexMatches &matches,
     const Camera<> &camera,
     const int ransac_max_iterations = 100,
     const double ransac_image_distance_threshold = 3
 ) {
-
-  IndexMatches matches = match_landmarks(keypoints, descriptors, current_pose, map, camera);
 
   opengv::bearingVectors_t bearing_vectors;
   opengv::points_t absolute_points;
@@ -587,7 +538,7 @@ std::pair<Pose, IndexMatches> localize(
   ransac.threshold_ = 1.0 - cos(atan(ransac_image_distance_threshold / 500.0));
   ransac.max_iterations_ = ransac_max_iterations;
 
-  ransac.computeModel(0);
+  ransac.computeModel();
 
   // TODO: This is not done internally?
   adapter.sett(ransac.model_coefficients_.col(3));
@@ -608,6 +559,65 @@ std::pair<Pose, IndexMatches> localize(
     inliers.emplace_back(matches[i]);
 
   return {pose, inliers};
+}
+
+std::unordered_set<int> get_used_keypoint_indices(const Map &map, int keyframe_index) {
+  std::unordered_set<int> used_indices;
+  for (const auto &[_, landmark] : map.landmarks) {
+    if (landmark.observations.contains(keyframe_index)) {
+      used_indices.insert(landmark.observations.at(keyframe_index));
+    }
+  }
+
+  return used_indices;
+}
+
+Eigen::Matrix3d compute_essential_matrix(const Pose &relative_pose) {
+  const Position t = relative_pose.translation() / relative_pose.translation().norm();
+  Eigen::Matrix3d t_hat;
+  t_hat << 0, -t(2), t(1), t(2), 0, -t(0), -t(1), t(0), 0;
+  Eigen::Matrix3d E{t_hat * relative_pose.rotationMatrix()};
+  return E;
+}
+
+// Find inliers with known poses using the epipolar constraint.
+IndexMatches find_inliers_epipolar(
+    const IndexMatches &matches,
+    const Keyframe &keyframe_1,
+    const Keyframe &keyframe_2,
+    const Camera<> &camera,
+    double max_epipolar_error = 1e-3
+) {
+  Eigen::Matrix3d E = compute_essential_matrix(keyframe_1.pose.inverse() * keyframe_2.pose);
+
+  // Filter out matches that do not satisfy the epipolar constraint.
+  IndexMatches inliers;
+  for (const auto &[index_1, index_2] : matches) {
+    Position unprojected_1 = camera.unproject(keyframe_1.keypoints[index_1].cast<double>());
+    Position unprojected_2 = camera.unproject(keyframe_2.keypoints[index_2].cast<double>());
+
+    if (unprojected_1.transpose() * E * unprojected_2 < max_epipolar_error) {
+      inliers.emplace_back(index_1, index_2);
+    }
+  }
+
+  return inliers;
+}
+
+// Remove keyframe including its observations and landmarks without any observations.
+int remove_keyframe(int index, Map &map) {
+  map.keyframes.erase(index);
+
+  for (auto it = map.landmarks.begin(); it != map.landmarks.end();) {
+    Landmark &landmark = it->second;
+    landmark.observations.erase(index);
+
+    if (landmark.observations.empty()) {
+      it = map.landmarks.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 #endif //VISUAL_ODOMETRY_UTILS_H_

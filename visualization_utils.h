@@ -59,7 +59,7 @@ void draw_new_pose(
 ) {
   std::unordered_map<int, Point> landmark_points = project_landmarks(map.landmarks, pose, camera);
 
-  // Draw matching landmarks and keypoints in green.
+  // Draw matching landmarks and keypoints.
   std::unordered_set<int> matched_landmark_indices;
   std::unordered_set<int> matched_keypoint_indices;
   for (const auto &[landmark_index, keypoint_index] : landmark_to_keypoint) {
@@ -90,7 +90,9 @@ void draw_new_pose(
 }
 
 // Draw projected landmarks and keypoints for a keyframe.
-void draw_keyframe(cv::Mat &image, int keyframe_index, const Map &map, const Camera<> &camera) {
+void draw_keyframe(
+    cv::Mat &image, int keyframe_index, int last_keyframe_index, const Map &map, const Camera<> &camera
+) {
   const Keyframe &keyframe = map.keyframes.at(keyframe_index);
 
   std::unordered_map<int, Point> landmark_points = project_landmarks(map.landmarks, keyframe.pose, camera);
@@ -105,8 +107,11 @@ void draw_keyframe(cv::Mat &image, int keyframe_index, const Map &map, const Cam
     cv::Point2d cv_landmark_point{landmark_points[index].x(), landmark_points[index].y()};
 
     if (landmark.observations.contains(keyframe_index)) {
-      // Color green for matches.
-      color = CV_RGB(0, 255, 0);
+      // TODO: This does not hold when keyframes are removed.
+      // Color green for older matches, cyan for new ones.
+      color =
+          landmark.observations.size() == 2 && landmark.observations.contains(last_keyframe_index) ? CV_RGB(0, 255, 255)
+                                                                                                   : CV_RGB(0, 0, 255);
       const int keypoint_index = landmark.observations.at(keyframe_index);
       matched_keypoint_indices.insert(keypoint_index);
 
@@ -130,11 +135,12 @@ void draw_keyframe(cv::Mat &image, int keyframe_index, const Map &map, const Cam
 }
 
 void show_keyframes(
-    const std::vector<std::string> &image_paths, const std::vector<int> &indices, const Map &map, const Camera<> &camera
+    const std::vector<int> &indices, const Map &map, int last_keyframe_index, const Camera<> &camera
 ) {
   for (const int &index : indices) {
-    cv::Mat image = cv::imread(image_paths[index]);
-    draw_keyframe(image, index, map, camera);
+    cv::Mat image = map.keyframes.at(index).image.clone();
+    cv::cvtColor(image, image, cv::COLOR_GRAY2RGB);
+    draw_keyframe(image, index, last_keyframe_index, map, camera);
     cv::imshow(std::to_string(index), image);
   }
   cv::waitKey(0);
