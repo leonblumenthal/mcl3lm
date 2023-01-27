@@ -57,7 +57,7 @@ void draw_new_pose(
     const Map &map,
     const Camera<> &camera
 ) {
-  std::unordered_map<int, Point> landmark_points = project_landmarks(map.landmarks, pose, camera);
+  std::unordered_map<int, Point> landmark_points = vo_utils::project_landmarks(map.landmarks, pose, camera);
 
   // Draw matching landmarks and keypoints.
   std::unordered_set<int> matched_landmark_indices;
@@ -95,7 +95,7 @@ void draw_keyframe(
 ) {
   const Keyframe &keyframe = map.keyframes.at(keyframe_index);
 
-  std::unordered_map<int, Point> landmark_points = project_landmarks(map.landmarks, keyframe.pose, camera);
+  std::unordered_map<int, Point> landmark_points = vo_utils::project_landmarks(map.landmarks, keyframe.pose, camera);
 
   // Draw each landmark and the matching keypoint if applicable.
   std::unordered_set<int> matched_keypoint_indices;
@@ -111,7 +111,7 @@ void draw_keyframe(
       // Color green for older matches, cyan for new ones.
       color =
           landmark.observations.size() == 2 && landmark.observations.contains(last_keyframe_index) ? CV_RGB(0, 255, 255)
-                                                                                                   : CV_RGB(0, 0, 255);
+                                                                                                   : CV_RGB(0, 255, 0);
       const int keypoint_index = landmark.observations.at(keyframe_index);
       matched_keypoint_indices.insert(keypoint_index);
 

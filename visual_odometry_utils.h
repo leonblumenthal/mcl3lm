@@ -48,6 +48,8 @@ struct Map {
   int next_landmark_index = 0;
 };
 
+namespace vo_utils {
+
 bool is_in_bounds(int x, int y, const cv::Mat &image, int edge_margin = 0) {
   return (x >= edge_margin && x < image.cols - edge_margin && y >= edge_margin && y < image.rows - edge_margin);
 }
@@ -402,7 +404,7 @@ struct BundleAdjustmentReprojectionCostFunctor {
   }
 };
 
-void bundle_adjustment(
+ceres::Solver::Summary bundle_adjustment(
     Map &map, const Camera<> &camera, int max_num_iterations = 20
 ) {
 
@@ -437,7 +439,8 @@ void bundle_adjustment(
   options.num_threads = std::thread::hardware_concurrency();
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
-  std::cout << summary.BriefReport() << std::endl;
+
+  return summary;
 }
 
 // Find a matching landmark for each keypoint.
@@ -619,6 +622,94 @@ int remove_keyframe(int index, Map &map) {
     }
   }
 }
+
+}
+
+
+
+struct VisualOdometryConfig {
+  struct Initialize {
+    struct Keypoints {
+      int max_num = 500;
+      double quality_level = 0.01;
+      int min_distance_between = 8;
+      int edge_margin = 20;
+      int descriptor_angle_patch_radius = 15;
+    };
+    Keypoints keypoints;
+
+    struct Matching {
+      int max_distance = 100;
+      double max_second_to_first_distance_ratio = 1.1;
+
+      struct Ransac {
+        double threshold = 5e-6;
+        int min_num_inliers = 20;
+        int max_num_iterations = 100;
+      };
+      Ransac ransac;
+    };
+    Matching matching;
+
+    int max_num_bundle_adjustment_iterations = 100;
+  };
+  Initialize initialize;
+
+  struct Next {
+    struct Keypoints {
+      int max_num = 500;
+      double quality_level = 0.01;
+      int min_distance_between = 8;
+      int edge_margin = 20;
+      int descriptor_angle_patch_radius = 15;
+    };
+    Keypoints keypoints;
+
+    struct Matching {
+      double max_image_distance = 20;
+      double max_descriptor_distance = 70;
+      double max_second_to_first_distance_ratio = 1.2;
+
+      struct Ransac {
+        int max_num_iterations = 100;
+        double image_distance_threshold = 3;
+      };
+      Ransac ransac;
+    };
+    Matching matching;
+
+    struct Keyframe {
+      struct IsNext {
+        // TODO: This depends on the initial scale.
+        double min_distance_to_last = 0.2;
+        int max_num_landmark_keypoint_inliers = 60;
+        int min_num_landmark_keypoint_inliers = 20;
+      };
+      IsNext is_next;
+
+      int max_num_keyframes = 20;
+
+      struct Matching {
+        int max_distance = 70;
+        double max_second_to_first_distance_ratio = 1.2;
+
+        struct Ransac {
+          double threshold = 5e-6;
+          int min_num_inliers = 20;
+          int max_num_iterations = 100;
+        };
+        Ransac ransac;
+
+        double max_epipolar_error = 1e-3;
+      };
+      Matching matching;
+
+      int max_num_bundle_adjustment_iterations = 100;
+    };
+    Keyframe keyframe;
+  };
+  Next next;
+};
 
 #endif //VISUAL_ODOMETRY_UTILS_H_
 

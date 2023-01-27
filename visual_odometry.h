@@ -22,10 +22,13 @@
 #include "camera.h"
 #include <fmt/core.h>
 #include "visualization_utils.h"
+#include "visual_odometry_reports.h"
 
 struct VisualOdometry {
 
   const Camera<> camera;
+
+  const VisualOdometryConfig config;
 
   Map map;
   Pose current_pose;
@@ -34,62 +37,44 @@ struct VisualOdometry {
 
   std::queue<int> keyframe_indices;
 
-  explicit VisualOdometry(const Camera<> &camera) : camera(camera) {
-    current_pose = Pose::rotX(0);
+  bool return_reports;
+
+  explicit VisualOdometry(
+      const Camera<> &camera, bool return_reports = true, const VisualOdometryConfig &config = VisualOdometryConfig())
+      : camera(camera), return_reports(return_reports), config(config), current_pose(Pose::rotX(0)) {
   }
 
-  void initialize(const cv::Mat &image_1, const cv::Mat &image_2, double distance_between) {
+  std::optional<VisualOdometryInitializeReport> initialize(
+      const cv::Mat &image_1, const cv::Mat &image_2, const Pose &pose_1, const Pose &pose_2
+  ) {
 
-    constexpr int max_num_keypoints = 500;
-    constexpr double keypoint_quality_level = 0.01;
-    constexpr int min_distance_between_keypoints = 8;
-    constexpr int keypoint_edge_margin = 16;
-    constexpr int descriptor_angle_patch_radius = 15;
-    auto [keypoints_1, descriptors_1] = compute_keypoints_and_descriptors(
-        image_1,
-        max_num_keypoints,
-        keypoint_quality_level,
-        min_distance_between_keypoints,
-        keypoint_edge_margin,
-        descriptor_angle_patch_radius
-    );
-    auto [keypoints_2, descriptors_2] = compute_keypoints_and_descriptors(
-        image_2,
-        max_num_keypoints,
-        keypoint_quality_level,
-        min_distance_between_keypoints,
-        keypoint_edge_margin,
-        descriptor_angle_patch_radius
-    );
+    auto [keypoints_1, descriptors_1] = initialize_compute_keypoints_and_descriptors(image_1);
+    auto [keypoints_2, descriptors_2] = initialize_compute_keypoints_and_descriptors(image_2);
 
-    constexpr int max_distance = 100;
-    constexpr double max_second_to_first_distance_ratio = 1.1;
-    IndexMatches matches = match(descriptors_1, descriptors_2, max_distance, max_second_to_first_distance_ratio);
+    IndexMatches matches = initialize_match(descriptors_1, descriptors_2);
 
-    constexpr double ransac_threshold = 5e-6;
-    constexpr int ransac_min_num_inliers = 16;
-    constexpr int ransac_max_iterations = 100;
-    auto [inlier_matches, relative_pose] = find_inliers_ransac(
-        matches, keypoints_1, keypoints_2, camera, ransac_threshold, ransac_min_num_inliers, ransac_max_iterations
+    auto [inlier_matches, relative_pose] = initialize_find_inliers_ransac(
+        matches, keypoints_1, keypoints_2
     );
-    relative_pose.translation() *= distance_between;
+    relative_pose.translation() *= (pose_1.translation() - pose_2.translation()).norm();
 
     map.keyframes[0] = {
-        Pose::rotX(0), keypoints_1, descriptors_1, image_1
+        pose_1, keypoints_1, descriptors_1, image_1
     };
+    // TODO: Actually use pose_2.
     map.keyframes[1] = {
-        relative_pose, keypoints_2, descriptors_2, image_2
+        // pose_2, keypoints_2, descriptors_2, image_2
+        pose_1 * relative_pose, keypoints_2, descriptors_2, image_2
     };
 
-    Positions landmark_positions = triangulate(inlier_matches, map.keyframes[0], map.keyframes[1], camera);
+    Positions landmark_positions = vo_utils::triangulate(inlier_matches, map.keyframes[0], map.keyframes[1], camera);
     for (int i = 0; i < inlier_matches.size(); ++i) {
       const auto &match = inlier_matches[i];
       map.landmarks[map.next_landmark_index++] = {
           landmark_positions[i], {{0, match.first}, {1, match.second}}};
     }
 
-    constexpr int max_num_iterations = 100;
-    bundle_adjustment(map, camera, max_num_iterations);
+    ceres::Solver::Summary bundle_adjustment_summary = initialze_bundle_adjustment();
 
     current_pose = map.keyframes[1].pose;
     last_keyframe_index = 1;
@@ -98,105 +83,50 @@ struct VisualOdometry {
     keyframe_indices.push(0);
     keyframe_indices.push(1);
 
-    fmt::print("Initialized VO Map with {} landmarks:\n", map.landmarks.size());
-    fmt::print("  #keypoints: {}, {}\n", keypoints_1.size(), keypoints_2.size());
-    fmt::print(
-        "  #inliers: {} ({:.0f}% matches)\n", inlier_matches.size(), 100.0 * inlier_matches.size() / matches.size());
-    fmt::print("\n");
+    if (return_reports) {
+      return VisualOdometryInitializeReport{
+          keypoints_1.size(), keypoints_2.size(), matches.size(), inlier_matches.size(), bundle_adjustment_summary,
+      };
+    }
+
   }
 
-  bool next(const cv::Mat &image) {
+  std::tuple<bool,
+             std::optional<VisualOdometryNextReport>,
+             std::optional<VisualOdometryKeyframeReport>> next(const cv::Mat &image) {
     ++current_frame_index;
 
-    constexpr int max_num_keypoints = 500;
-    constexpr double keypoint_quality_level = 0.01;
-    constexpr int min_distance_between_keypoints = 8;
-    // This is also influenced by the patterns and should not be smaller than 20.
-    constexpr int keypoint_edge_margin = 20;
-    constexpr int descriptor_angle_patch_radius = 15;
-    auto [keypoints, descriptors] = compute_keypoints_and_descriptors(
-        image,
-        max_num_keypoints,
-        keypoint_quality_level,
-        min_distance_between_keypoints,
-        keypoint_edge_margin,
-        descriptor_angle_patch_radius
-    );
+    auto [keypoints, descriptors] = next_compute_keypoints_and_descriptors(image);
 
-    std::unordered_map<int, Point> landmark_points = project_landmarks(map.landmarks, current_pose, camera);
+    std::unordered_map<int, Point> landmark_points = vo_utils::project_landmarks(map.landmarks, current_pose, camera);
 
-    constexpr double max_image_distance = 20;
-    constexpr double max_descriptor_distance = 70;
-    constexpr double max_second_to_first_distance_ratio = 1.2;
-    IndexMatches landmark_keypoint_matches = match_landmarks(
-        keypoints,
-        descriptors,
-        map,
-        landmark_points,
-        max_image_distance,
-        max_descriptor_distance,
-        max_second_to_first_distance_ratio
-    );
+    IndexMatches landmark_keypoint_matches = next_match_landmarks(keypoints, descriptors, landmark_points);
 
     constexpr int ransac_max_iterations = 100;
     constexpr double ransac_image_distance_threshold = 3;
-    auto [pose, landmark_keypoint_inliers] = localize(
-        keypoints, map, landmark_keypoint_matches, camera, ransac_max_iterations, ransac_image_distance_threshold
-    );
+    auto [pose, landmark_keypoint_inliers] = next_localize(keypoints, landmark_keypoint_matches);
 
-    const double
-        distance_to_last_keyframe = (map.keyframes[last_keyframe_index].pose.translation() - pose.translation()).norm();
-    const double distance_to_last_frame = (current_pose.translation() - pose.translation()).norm();
-    const Pose pose_to_last_keyframe = map.keyframes[last_keyframe_index].pose.inverse() * pose;
-    const Pose pose_to_last_frame = current_pose.inverse() * pose;
+    std::optional<VisualOdometryNextReport> next_report;
+    std::optional<VisualOdometryKeyframeReport> keyframe_report;
+    if (return_reports) {
+      next_report = {
+          current_frame_index, keypoints.size(), landmark_points.size(), map.landmarks.size(),
+          landmark_keypoint_matches.size(), landmark_keypoint_inliers.size(),
+          (map.keyframes[last_keyframe_index].pose.translation() - pose.translation()).norm(),
+          (current_pose.translation() - pose.translation()).norm()
+      };
+    }
 
-    fmt::print("Frame {}:\n", current_frame_index);
-    fmt::print(
-        "  #visible landmarks: {} ({:.0f}% all)\n",
-        landmark_points.size(),
-        100.0 * landmark_points.size() / map.landmarks.size());
-    fmt::print("  #keypoints: {}\n", keypoints.size());
-    fmt::print(
-        "  #matches: {} ({:.0f}% keypoints, {:.0f}% visible landmarks)\n",
-        landmark_keypoint_matches.size(),
-        100.0 * landmark_keypoint_matches.size() / keypoints.size(),
-        100.0 * landmark_keypoint_matches.size() / landmark_points.size());
-    fmt::print(
-        "  #inliers: {} ({:.0f}% matches, {:.0f}% visible landmarks)\n",
-        landmark_keypoint_inliers.size(),
-        100.0 * landmark_keypoint_inliers.size() / landmark_keypoint_matches.size(),
-        100.0 * landmark_keypoint_inliers.size() / landmark_points.size());
-    fmt::print("  distance to last frame: {:.2}, keyframe: {:.2}\n", distance_to_last_frame, distance_to_last_keyframe);
-    fmt::print(
-        "  translation to last frame: {:.4f}, {:.4f}, {:.4f}, keyframe: {:.4f}, {:.4f}, {:.4f}\n",
-        pose_to_last_frame.translation().x(),
-        pose_to_last_frame.translation().y(),
-        pose_to_last_frame.translation().z(),
-        pose_to_last_keyframe.translation().x(),
-        pose_to_last_keyframe.translation().y(),
-        pose_to_last_keyframe.translation().z());
-    fmt::print(
-        "  rotation to last frame: {:.4f}, {:.4f}, {:.4f}, keyframe: {:.4f}, {:.4f}, {:.4f}\n",
-        pose_to_last_frame.angleX(),
-        pose_to_last_frame.angleY(),
-        pose_to_last_frame.angleZ(),
-        pose_to_last_keyframe.angleX(),
-        pose_to_last_keyframe.angleY(),
-        pose_to_last_keyframe.angleZ());
-
-    if (landmark_keypoint_inliers.size() < 5) return false;
+    if (landmark_keypoint_inliers.size() < 5) return {false, next_report, keyframe_report};
 
     current_pose = pose;
 
+    const double
+        distance_to_last_keyframe = (map.keyframes[last_keyframe_index].pose.translation() - pose.translation()).norm();
 
-
-    // TODO: This value depends on the initial scale.
-    const double min_distance_to_last_keyframe = 0.2;
-    const int max_num_landmark_keypoint_inliers = 60;
-    const int min_num_landmark_keypoint_inliers = 20;
-    bool is_next_keyframe = (distance_to_last_keyframe > min_distance_to_last_keyframe
-        && landmark_keypoint_inliers.size() < max_num_landmark_keypoint_inliers)
-        || landmark_keypoint_inliers.size() < min_num_landmark_keypoint_inliers;
+    bool is_next_keyframe = (distance_to_last_keyframe > config.next.keyframe.is_next.min_distance_to_last
+        && landmark_keypoint_inliers.size() < config.next.keyframe.is_next.max_num_landmark_keypoint_inliers)
+        || landmark_keypoint_inliers.size() < config.next.keyframe.is_next.min_num_landmark_keypoint_inliers;
 
     if (is_next_keyframe) {
 
@@ -208,57 +138,36 @@ struct VisualOdometry {
 
       keyframe_indices.push(new_keyframe_index);
 
-      int num_removed_landmarks = map.landmarks.size();
+      size_t num_removed_landmarks = map.landmarks.size();
       int removed_keyframe_index = -1;
-      constexpr int max_num_keyframes = 10;
       // This should only be executed once actually.
-      if (keyframe_indices.size() > max_num_keyframes) {
+      if (keyframe_indices.size() > config.next.keyframe.max_num_keyframes) {
         removed_keyframe_index = keyframe_indices.front();
         keyframe_indices.pop();
-        remove_keyframe(removed_keyframe_index, map);
+        vo_utils::remove_keyframe(removed_keyframe_index, map);
       }
       num_removed_landmarks -= map.landmarks.size();
 
-      std::unordered_set<int> new_used_keypoint_indices = get_used_keypoint_indices(map, new_keyframe_index);
-      std::unordered_set<int> last_used_keypoint_indices = get_used_keypoint_indices(map, last_keyframe_index);
+      std::unordered_set<int> new_used_keypoint_indices = vo_utils::get_used_keypoint_indices(map, new_keyframe_index);
+      std::unordered_set<int>
+          last_used_keypoint_indices = vo_utils::get_used_keypoint_indices(map, last_keyframe_index);
 
       Keyframe &new_keyframe = map.keyframes[new_keyframe_index];
       Keyframe &last_keyframe = map.keyframes[last_keyframe_index];
 
-      constexpr int max_distance = 70;
-      constexpr double max_second_to_first_distance_ratio = 1.2;
-      IndexMatches new_last_matches = match(
-          new_keyframe.descriptors,
-          last_keyframe.descriptors,
-          max_distance,
-          max_second_to_first_distance_ratio,
-          new_used_keypoint_indices,
-          last_used_keypoint_indices
+      IndexMatches new_last_matches = next_match(
+          new_keyframe.descriptors, last_keyframe.descriptors, new_used_keypoint_indices, last_used_keypoint_indices
       );
 
-      // cv::Mat new_rgb_image;
-      // cv::Mat last_rgb_image;
-      // cv::cvtColor(image, new_rgb_image, cv::COLOR_GRAY2BGR);
-      // cv::cvtColor(last_keyframe.image, last_rgb_image, cv::COLOR_GRAY2BGR);
-
-
-      constexpr double ransac_threshold = 5e-6;
-      constexpr int ransac_min_num_inliers = 16;
-      constexpr int ransac_max_iterations = 100;
-      auto [new_last_inliers_ransac, _] = find_inliers_ransac(
-          new_last_matches,
-          new_keyframe.keypoints,
-          last_keyframe.keypoints,
-          camera,
-          ransac_threshold,
-          ransac_min_num_inliers,
-          ransac_max_iterations
+      auto [new_last_inliers_ransac, _] = next_find_inliers_ransac(
+          new_last_matches, new_keyframe.keypoints, last_keyframe.keypoints
       );
-      constexpr double max_epipolar_error = 1e-3;
-      IndexMatches new_last_inliers_epipolar =
-          find_inliers_epipolar(new_last_inliers_ransac, new_keyframe, last_keyframe, camera, max_epipolar_error);
+      IndexMatches new_last_inliers_epipolar = vo_utils::find_inliers_epipolar(
+          new_last_inliers_ransac, new_keyframe, last_keyframe, camera, config.next.keyframe.matching.max_epipolar_error
+      );
 
-      Positions new_landmark_positions = triangulate(new_last_inliers_epipolar, new_keyframe, last_keyframe, camera);
+      Positions new_landmark_positions =
+          vo_utils::triangulate(new_last_inliers_epipolar, new_keyframe, last_keyframe, camera);
       for (int i = 0; i < new_last_inliers_epipolar.size(); ++i) {
         const auto &[new_keypoint_index, last_keypoint_index] = new_last_inliers_epipolar[i];
         map.landmarks[map.next_landmark_index++] = {
@@ -266,49 +175,139 @@ struct VisualOdometry {
             {{new_keyframe_index, new_keypoint_index}, {last_keyframe_index, last_keypoint_index}}};
       }
 
-      constexpr int max_num_iterations = 20;
-      bundle_adjustment(map, camera, max_num_iterations);
+      ceres::Solver::Summary bundle_adjustment_summary = next_bundle_adjustment();
 
       current_pose = new_keyframe.pose;
 
-      if (removed_keyframe_index > -1) {
-        fmt::print("Removed keyframe {} and {} landmarks\n", removed_keyframe_index, num_removed_landmarks);
-      }
-      fmt::print("New keyframe {}, matching with {}\n", new_keyframe_index, last_keyframe_index);
-      const int num_new_unused_keypoints = new_keyframe.keypoints.size() - new_used_keypoint_indices.size();
-      const int num_last_unused_keypoints = last_keyframe.keypoints.size() - last_used_keypoint_indices.size();
-      fmt::print(
-          "  #unused keypoints: {} ({:.2f}% all), {} ({:.2f}% all)\n",
-          num_new_unused_keypoints,
-          100.0 * (num_new_unused_keypoints) / new_keyframe.keypoints.size(),
-          num_last_unused_keypoints,
-          100.0 * (num_last_unused_keypoints) / last_keyframe.keypoints.size());
-      fmt::print(
-          "  #matches: {}, ({:.2f}% new unused), ({:.2f}% last unused)\n",
-          new_last_matches.size(),
-          100.0 * (new_last_matches.size()) / num_new_unused_keypoints,
-          100.0 * (new_last_matches.size()) / num_last_unused_keypoints
-      );
-      fmt::print(
-          "  #inliers ransac: {} ({:.2f}% matches)\n",
-          new_last_inliers_ransac.size(),
-          100.0 * (new_last_inliers_ransac.size()) / new_last_matches.size());
-      fmt::print(
-          "  #inliers epipolar: {} ({:.2f}% inliers ransac), ({:.2f}% matches)\n",
-          new_last_inliers_epipolar.size(),
-          100.0 * (new_last_inliers_epipolar.size()) / new_last_inliers_ransac.size(),
-          100.0 * (new_last_inliers_epipolar.size()) / new_last_matches.size());
-      fmt::print("  #total keyframes: {}\n", map.keyframes.size());
-      fmt::print("  #total landmarks: {}\n", map.landmarks.size());
-
       // TODO: Remove
       // show_keyframes({last_keyframe_index, new_keyframe_index}, map, new_keyframe_index, camera);
+
+      if (return_reports) {
+        keyframe_report = {
+            removed_keyframe_index, num_removed_landmarks, new_keyframe_index, last_keyframe_index,
+            new_keyframe.keypoints.size(), last_keyframe.keypoints.size(),
+            new_keyframe.keypoints.size() - new_used_keypoint_indices.size(),
+            last_keyframe.keypoints.size() - last_used_keypoint_indices.size(), new_last_matches.size(),
+            new_last_inliers_ransac.size(), new_last_inliers_epipolar.size(), map.keyframes.size(),
+            map.landmarks.size(), bundle_adjustment_summary
+        };
+      }
 
       last_keyframe_index = new_keyframe_index;
 
     }
 
-    return true;
+    return {true, next_report, keyframe_report};
+  }
+
+  // Methods that call vo_utils functions with specific arguments.
+ private:
+  std::pair<Keypoints, Descriptors> initialize_compute_keypoints_and_descriptors(const cv::Mat &image) const {
+    return vo_utils::compute_keypoints_and_descriptors(
+        image,
+        config.initialize.keypoints.max_num,
+        config.initialize.keypoints.quality_level,
+        config.initialize.keypoints.min_distance_between,
+        config.initialize.keypoints.edge_margin,
+        config.initialize.keypoints.descriptor_angle_patch_radius
+    );
+  }
+
+  IndexMatches initialize_match(const Descriptors &descriptors_1, const Descriptors &descriptors_2) const {
+    return vo_utils::match(
+        descriptors_1,
+        descriptors_2,
+        config.initialize.matching.max_distance,
+        config.initialize.matching.max_second_to_first_distance_ratio
+    );
+  }
+
+  std::pair<IndexMatches, Pose> initialize_find_inliers_ransac(
+      const IndexMatches &matches, const Keypoints &keypoints_1, const Keypoints &keypoints_2
+  ) const {
+    return vo_utils::find_inliers_ransac(
+        matches,
+        keypoints_1,
+        keypoints_2,
+        camera,
+        config.initialize.matching.ransac.threshold,
+        config.initialize.matching.ransac.min_num_inliers,
+        config.initialize.matching.ransac.max_num_iterations
+    );
+  }
+
+  ceres::Solver::Summary initialze_bundle_adjustment() {
+    return vo_utils::bundle_adjustment(map, camera, config.initialize.max_num_bundle_adjustment_iterations);
+  }
+
+  std::pair<Keypoints, Descriptors> next_compute_keypoints_and_descriptors(const cv::Mat &image) const {
+    return vo_utils::compute_keypoints_and_descriptors(
+        image,
+        config.next.keypoints.max_num,
+        config.next.keypoints.quality_level,
+        config.next.keypoints.min_distance_between,
+        config.next.keypoints.edge_margin,
+        config.next.keypoints.descriptor_angle_patch_radius
+    );
+  }
+
+  IndexMatches next_match_landmarks(
+      const Keypoints &keypoints, const Descriptors &descriptors, const std::unordered_map<int, Point> &landmark_points
+  ) const {
+    return vo_utils::match_landmarks(
+        keypoints,
+        descriptors,
+        map,
+        landmark_points,
+        config.next.matching.max_image_distance,
+        config.next.matching.max_descriptor_distance,
+        config.next.matching.max_second_to_first_distance_ratio
+    );
+  }
+
+  std::pair<Pose, IndexMatches> next_localize(const Keypoints &keypoints, const IndexMatches &matches) const {
+    return vo_utils::localize(
+        keypoints,
+        map,
+        matches,
+        camera,
+        config.next.matching.ransac.max_num_iterations,
+        config.next.matching.ransac.image_distance_threshold
+    );
+  }
+
+  IndexMatches next_match(
+      const Descriptors &descriptors_1,
+      const Descriptors &descriptors_2,
+      const std::unordered_set<int> &used_indices_1,
+      const std::unordered_set<int> &used_indices_2
+  ) const {
+    return vo_utils::match(
+        descriptors_1,
+        descriptors_2,
+        config.next.keyframe.matching.max_distance,
+        config.next.keyframe.matching.max_second_to_first_distance_ratio,
+        used_indices_1,
+        used_indices_2
+    );
+  }
+
+  std::pair<IndexMatches, Pose> next_find_inliers_ransac(
+      const IndexMatches &matches, const Keypoints &keypoints_1, const Keypoints &keypoints_2
+  ) const {
+    return vo_utils::find_inliers_ransac(
+        matches,
+        keypoints_1,
+        keypoints_2,
+        camera,
+        config.next.keyframe.matching.ransac.threshold,
+        config.next.keyframe.matching.ransac.min_num_inliers,
+        config.next.keyframe.matching.ransac.max_num_iterations
+    );
+  }
+
+  ceres::Solver::Summary next_bundle_adjustment() {
+    return vo_utils::bundle_adjustment(map, camera, config.next.keyframe.max_num_bundle_adjustment_iterations);
   }
 
 };
