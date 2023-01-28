@@ -206,6 +206,8 @@ struct VisualOdometryKeyframeReport {
   }
 };
 
+
+
 // TODO: Actually do with report base class.
 struct ReportWriter {
   const std::string path;

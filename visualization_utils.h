@@ -135,13 +135,17 @@ void draw_keyframe(
 }
 
 void show_keyframes(
-    const std::vector<int> &indices, const Map &map, int last_keyframe_index, const Camera<> &camera
+    const std::vector<int> &indices,
+    const Map &map,
+    int last_keyframe_index,
+    const Camera<> &camera,
+    const std::string &window_name = ""
 ) {
   for (const int &index : indices) {
     cv::Mat image = map.keyframes.at(index).image.clone();
     cv::cvtColor(image, image, cv::COLOR_GRAY2RGB);
     draw_keyframe(image, index, last_keyframe_index, map, camera);
-    cv::imshow(std::to_string(index), image);
+    cv::imshow(window_name.empty() ? std::to_string(index) : window_name, image);
   }
   cv::waitKey(0);
 }

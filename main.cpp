@@ -31,116 +31,11 @@
 #include "features.h"
 
 #include <opencv2/calib3d.hpp>
-#include "visual_odometry_reports.h"
+#include "reports.h"
 #include "visualization_utils.h"
 #include "visual_odometry.h"
 #include "io_utils.h"
-
-struct ALignmentCostFunctor {
-
-  const Position &landmark_position;
-  const Vertex &vertex;
-
-  ALignmentCostFunctor(
-      const Position &landmark_position, const Vertex &vertex
-  ) : landmark_position(landmark_position), vertex(vertex) {}
-
-  template<class T>
-  bool operator()(
-      T const *const stransformation, T *sResiduals
-  ) const {
-    // Map inputs to ceres::Jet types.
-    Eigen::Map<Sophus::Sim3<T> const> const transformation(stransformation);
-    Eigen::Map<Eigen::Matrix<T, 3, 1>> residuals(sResiduals);
-
-    residuals = transformation * landmark_position.cast<T>() - vertex.cast<T>();
-
-    return true;
-  }
-};
-
-Sophus::Sim3d alignment(
-    std::vector<std::pair<const Position, const Vertex>> &correspondences,
-    int max_num_iterations = 20,
-    double huber_loss_parameter = 1.0
-) {
-
-  ceres::Problem problem;
-
-  Sophus::Sim3d transformation{Eigen::Matrix4d::Identity()};
-
-  problem.AddParameterBlock(
-      transformation.data(), Sophus::Sim3d::num_parameters, new Sophus::Manifold<Sophus::Sim3>());
-
-
-  // Add a residual block for each visible landmark position projected in each image.
-  for (auto &[landmark_position, vertex] : correspondences) {
-
-    // TODO: Actual huber loss from the paper.
-    problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<ALignmentCostFunctor, 3, Sophus::Sim3d::num_parameters>(
-            new ALignmentCostFunctor(
-                landmark_position, vertex
-            )), new ceres::HuberLoss(huber_loss_parameter), transformation.data());
-  }
-
-  ceres::Solver::Options options;
-  options.max_num_iterations = max_num_iterations;
-  options.linear_solver_type = ceres::SPARSE_SCHUR;
-  options.num_threads = std::thread::hardware_concurrency();
-  ceres::Solver::Summary summary;
-  ceres::Solve(
-      options, &problem, &summary
-  );
-
-  std::cout << summary.BriefReport() << std::endl;
-
-  return transformation;
-}
-
-
-void align(Sophus::Sim3d &local_to_map_transformation, const GeometricMap& geometric_map, const Map &map) {
-  double distance_threshold_start = 0.5;
-  double distance_threshold_end = 0.25;
-  int max_num_alignment_steps = 10;
-  int min_num_vertices_in_voxel = 10;
-  double standard_deviation_scale = 3;
-  int max_num_optimization_iterations = 20;
-
-  std::vector<std::pair<const Position, const Vertex>> correspondences;
-
-  for (int alignment_step = 0; alignment_step < max_num_alignment_steps; ++alignment_step) {
-    correspondences.clear();
-
-    double distance_threshold = distance_threshold_start
-        - (alignment_step + 1) * (distance_threshold_start - distance_threshold_end) / max_num_alignment_steps;
-
-    for (const auto &[landmark_index, landmark] : map.landmarks) {
-      Position transformed_position = local_to_map_transformation * landmark.position;
-
-      if (!geometric_map.is_valid(transformed_position, min_num_vertices_in_voxel, standard_deviation_scale)) continue;
-
-      std::optional<Vertex> nearest_vertex = geometric_map.get_nearest_vertex(transformed_position, distance_threshold);
-
-      if (!nearest_vertex) continue;
-
-      correspondences.emplace_back(transformed_position, nearest_vertex.value());
-    }
-
-    Sophus::Sim3d
-        new_transformation = alignment(correspondences, max_num_optimization_iterations, distance_threshold_end);
-
-    local_to_map_transformation *= new_transformation;
-
-    fmt::print(
-        "{}/{}: found {} valid correspondences with distance threshold {}\n",
-        alignment_step + 1,
-        max_num_alignment_steps,
-        correspondences.size(),
-        distance_threshold
-    );
-  }
-}
+#include "alignment.h"
 
 int main() {
 
@@ -154,10 +49,8 @@ int main() {
   const Camera camera{
       752.0, 480.0, {458.654, 457.296, 367.215, 248.375, -0.28340811, 0.07395907, 0.00019359, 1.76187114e-05}};
   const std::vector<std::string> image_paths = get_image_paths("../data/euroc_mav/V1_01_easy/cam0/data", "png");
-  // TODO: Poses seem to be wrong. Bundle adjustment works hard to correct them.
   // Specify initial two poses to start with correct scale.
   const std::pair<int, int> initial_keyframe_indices{100, 120};
-  // TODO: Somethin is messed up the the wxyz order, either here or in the notebook.
   const Pose initial_pose_1
       {Eigen::Quaterniond{-0.4277372, 0.62498984, -0.54384451, 0.36147164}, {0.87029955, 2.2052097, 0.92827237}};
   const Pose initial_pose_2
@@ -168,7 +61,8 @@ int main() {
       cv::imread(image_paths[initial_keyframe_indices.first], cv::IMREAD_GRAYSCALE),
       cv::imread(image_paths[initial_keyframe_indices.second], cv::IMREAD_GRAYSCALE),
       initial_pose_1,
-      initial_pose_2
+      initial_pose_2,
+      0, 1
   );
   if (initialize_report) {
     initialize_report->print();
@@ -182,14 +76,10 @@ int main() {
   // show_keyframes({0, 1}, vo.map, 1, vo.camera);
 
 
-  // TODO: Optimize in keyframe frame.
   Sophus::Sim3d local_to_map_transformation{Eigen::Matrix4d::Identity()};
 
   // align(local_to_map_transformation, geometric_map, vo.map);
 
-  std::cout << local_to_map_transformation.rotationMatrix() << std::endl;
-  std::cout << local_to_map_transformation.translation() << std::endl;
-  std::cout << local_to_map_transformation.scale() << std::endl;
 
   {
 
@@ -308,8 +198,6 @@ int main() {
   std::vector<Pose> trajectory{vo.map.keyframes[0].pose, vo.map.keyframes[1].pose};
   trajectory.reserve(image_paths.size());
 
-  trajectory.push_back(vo.map.keyframes[0].pose);
-  trajectory.push_back(vo.map.keyframes[1].pose);
 
   ReportWriter next_report_writer("../next_report.csv");
   ReportWriter keyframe_report_writer("../keyframe_report.csv");
@@ -331,14 +219,12 @@ int main() {
 
     if (!success) break;
 
-
     if (last_keyframe_index != vo.last_keyframe_index) {
       last_keyframe_index = vo.last_keyframe_index;
-      // align(local_to_map_transformation, geometric_map, vo.map);
+      align(local_to_map_transformation, geometric_map, vo.map);
       // show_keyframes({last_keyframe_index}, vo.map, last_keyframe_index, camera);
     }
 
-    // TODO: Transform entire pose.
     Pose transformed_pose = vo.current_pose;
     transformed_pose.translation() = local_to_map_transformation * transformed_pose.translation();
     trajectory.push_back(transformed_pose);

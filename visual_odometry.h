@@ -16,13 +16,20 @@
 #include <opengv/sac/Ransac.hpp>
 #include <opengv/sac_problems/relative_pose/CentralRelativePoseSacProblem.hpp>
 #include <opengv/triangulation/methods.hpp>
+#include <opengv/relative_pose/CentralRelativeAdapter.hpp>
+#include <opengv/relative_pose/methods.hpp>
+#include <opengv/sac/Ransac.hpp>
+#include <opengv/sac_problems/relative_pose/CentralRelativePoseSacProblem.hpp>
+#include <opengv/absolute_pose/CentralAbsoluteAdapter.hpp>
+#include <opengv/absolute_pose/methods.hpp>
+#include <opengv/sac_problems/absolute_pose/AbsolutePoseSacProblem.hpp>
 #include <sophus/ceres_manifold.hpp>
 #include <sophus/se3.hpp>
 #include <vector>
 #include "camera.h"
 #include <fmt/core.h>
 #include "visualization_utils.h"
-#include "visual_odometry_reports.h"
+#include "reports.h"
 
 struct VisualOdometry {
 
@@ -39,13 +46,13 @@ struct VisualOdometry {
 
   bool return_reports;
 
-  explicit VisualOdometry(
+  VisualOdometry(
       const Camera<> &camera, bool return_reports = true, const VisualOdometryConfig &config = VisualOdometryConfig())
       : camera(camera), return_reports(return_reports), config(config), current_pose(Pose::rotX(0)) {
   }
 
   std::optional<VisualOdometryInitializeReport> initialize(
-      const cv::Mat &image_1, const cv::Mat &image_2, const Pose &pose_1, const Pose &pose_2
+      const cv::Mat &image_1, const cv::Mat &image_2, const Pose &pose_1, const Pose &pose_2, const int index_1, const int index_2
   ) {
 
     auto [keypoints_1, descriptors_1] = initialize_compute_keypoints_and_descriptors(image_1);
@@ -56,32 +63,31 @@ struct VisualOdometry {
     auto [inlier_matches, relative_pose] = initialize_find_inliers_ransac(
         matches, keypoints_1, keypoints_2
     );
-    relative_pose.translation() *= (pose_1.translation() - pose_2.translation()).norm();
+    // relative_pose.translation() *= (pose_1.translation() - pose_2.translation()).norm();
 
-    map.keyframes[0] = {
+    map.keyframes[index_1] = {
         pose_1, keypoints_1, descriptors_1, image_1
     };
-    // TODO: Actually use pose_2.
-    map.keyframes[1] = {
-        // pose_2, keypoints_2, descriptors_2, image_2
-        pose_1 * relative_pose, keypoints_2, descriptors_2, image_2
+    map.keyframes[index_2] = {
+        pose_2, keypoints_2, descriptors_2, image_2
+        // pose_1 * relative_pose, keypoints_2, descriptors_2, image_2
     };
 
-    Positions landmark_positions = vo_utils::triangulate(inlier_matches, map.keyframes[0], map.keyframes[1], camera);
+    Positions landmark_positions = vo_utils::triangulate(inlier_matches, map.keyframes[index_1], map.keyframes[index_2], camera);
     for (int i = 0; i < inlier_matches.size(); ++i) {
       const auto &match = inlier_matches[i];
       map.landmarks[map.next_landmark_index++] = {
-          landmark_positions[i], {{0, match.first}, {1, match.second}}};
+          landmark_positions[i], {{index_1, match.first}, {index_2, match.second}}};
     }
 
     ceres::Solver::Summary bundle_adjustment_summary = initialze_bundle_adjustment();
 
-    current_pose = map.keyframes[1].pose;
-    last_keyframe_index = 1;
-    current_frame_index = 1;
+    current_pose = map.keyframes[index_2].pose;
+    last_keyframe_index = index_2;
+    current_frame_index = index_2;
 
-    keyframe_indices.push(0);
-    keyframe_indices.push(1);
+    keyframe_indices.push(index_1);
+    keyframe_indices.push(index_2);
 
     if (return_reports) {
       return VisualOdometryInitializeReport{
@@ -102,8 +108,6 @@ struct VisualOdometry {
 
     IndexMatches landmark_keypoint_matches = next_match_landmarks(keypoints, descriptors, landmark_points);
 
-    constexpr int ransac_max_iterations = 100;
-    constexpr double ransac_image_distance_threshold = 3;
     auto [pose, landmark_keypoint_inliers] = next_localize(keypoints, landmark_keypoint_matches);
 
     std::optional<VisualOdometryNextReport> next_report;
@@ -129,6 +133,8 @@ struct VisualOdometry {
         || landmark_keypoint_inliers.size() < config.next.keyframe.is_next.min_num_landmark_keypoint_inliers;
 
     if (is_next_keyframe) {
+
+      // TODO: Add comparison with all keyframes.
 
       int new_keyframe_index = current_frame_index;
       map.keyframes[new_keyframe_index] = Keyframe{current_pose, keypoints, descriptors, image};
@@ -178,9 +184,6 @@ struct VisualOdometry {
       ceres::Solver::Summary bundle_adjustment_summary = next_bundle_adjustment();
 
       current_pose = new_keyframe.pose;
-
-      // TODO: Remove
-      // show_keyframes({last_keyframe_index, new_keyframe_index}, map, new_keyframe_index, camera);
 
       if (return_reports) {
         keyframe_report = {

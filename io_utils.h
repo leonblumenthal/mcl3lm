@@ -84,4 +84,27 @@ void dump_trajectory(const std::vector<Pose> &trajectory, const std::string &pat
   out.close();
 }
 
+void dump_transformations(
+    const std::vector<Sophus::Sim3d> &transformations,
+    const std::string &path = "../transformations.csv"
+) {
+  std::ofstream out{path};
+
+  out << fmt::format("position_x,position_y,position_z,quaternion_w,quaternion_x,quaternion_y,quaternion_z\n");
+
+  for (const Sophus::Sim3d &transformation : transformations) {
+    out << fmt::format(
+        "{},{},{},{},{},{},{}\n",
+        transformation.translation().x(),
+        transformation.translation().y(),
+        transformation.translation().z(),
+        transformation.quaternion().w(),
+        transformation.quaternion().x(),
+        transformation.quaternion().y(),
+        transformation.quaternion().z());
+  }
+
+  out.close();
+}
+
 #endif //IO_UTILS_H_
