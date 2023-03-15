@@ -1,0 +1,10 @@
+# Python 3.10
+numpy
+open3d
+ipykernel
+plotly
+ipywidgets
+matplotlib
+plyfile
+pyaml
+scipy
