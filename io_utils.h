@@ -64,14 +64,29 @@ void dump_map(const Map &map, const std::string &path = "../map_dump") {
   out.close();
 }
 
-void dump_trajectory(const std::vector<Pose> &trajectory, const std::string &path = "../trajectory.csv") {
+void dump_trajectory(
+    const std::vector<Pose> &trajectory,
+    const std::string &path = "../trajectory.csv",
+    const std::vector<int> &initial_frame_indices = {0}
+) {
   std::ofstream out{path};
 
-  out << fmt::format("position_x,position_y,position_z,quaternion_w,quaternion_x,quaternion_y,quaternion_z\n");
+  out << fmt::format(
+      "frame_index,position_x,position_y,position_z,quaternion_w,quaternion_x,quaternion_y,quaternion_z\n"
+  );
 
-  for (const Pose &pose : trajectory) {
+  int frame_index;
+  for (int i = 0; i < trajectory.size(); ++i) {
+    if (i < initial_frame_indices.size()) {
+      frame_index = initial_frame_indices[i];
+    } else {
+      frame_index = initial_frame_indices.back() + i - initial_frame_indices.size() + 1;
+    }
+    const Pose &pose = trajectory[i];
+
     out << fmt::format(
-        "{},{},{},{},{},{},{}\n",
+        "{},{},{},{},{},{},{},{}\n",
+        frame_index,
         pose.translation().x(),
         pose.translation().y(),
         pose.translation().z(),
@@ -85,8 +100,7 @@ void dump_trajectory(const std::vector<Pose> &trajectory, const std::string &pat
 }
 
 void dump_transformations(
-    const std::vector<Sophus::Sim3d> &transformations,
-    const std::string &path = "../transformations.csv"
+    const std::vector<Sophus::Sim3d> &transformations, const std::string &path = "../transformations.csv"
 ) {
   std::ofstream out{path};
 

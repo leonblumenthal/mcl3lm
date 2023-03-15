@@ -1,36 +1,13 @@
 #include <Eigen/Dense>
-#include <fstream>
-#include <iostream>
 #include <map>
-#include <sstream>
-#include <string_view>
 #include <vector>
 #include <algorithm>
-#include "queue"
-
-#include "ceres/ceres.h"
 #include "pcl_map.h"
 #include <sophus/se3.hpp>
 #include <sophus/sim3.hpp>
-
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <opencv2/highgui.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/features2d.hpp>
-
 #include "filesystem"
-#include <opengv/relative_pose/CentralRelativeAdapter.hpp>
-#include <opengv/relative_pose/methods.hpp>
-#include <opengv/sac/Ransac.hpp>
-#include <opengv/sac_problems/relative_pose/CentralRelativePoseSacProblem.hpp>
-#include <opengv/absolute_pose/CentralAbsoluteAdapter.hpp>
-#include <opengv/absolute_pose/methods.hpp>
-#include <opengv/sac_problems/absolute_pose/AbsolutePoseSacProblem.hpp>
-
-#include "features.h"
-
-#include <opencv2/calib3d.hpp>
 #include "reports.h"
 #include "visualization_utils.h"
 #include "visual_odometry.h"
@@ -156,9 +133,11 @@ int main(int argc, char *argv[]) {
 
   // Alignment
   const bool do_alignment{config_data["alignment"]["do_alignment"]};
+  // const bool do_live_alignment{config_data["alignment"]["do_alignment"]};
   const AlignConfig align_config{
       static_cast<double>(config_data["alignment"]["align"]["distance_threshold_start"]) * voxel_size,
-      static_cast<double>(config_data["alignment"]["align"]["distance_threshold_end"]) * static_cast<double>(config_data["alignment"]["align"]["distance_threshold_start"]) * voxel_size,
+      static_cast<double>(config_data["alignment"]["align"]["distance_threshold_end"])
+          * static_cast<double>(config_data["alignment"]["align"]["distance_threshold_start"]) * voxel_size,
       config_data["alignment"]["align"]["max_num_alignment_steps"],
       config_data["alignment"]["align"]["min_num_vertices_in_voxel"],
       config_data["alignment"]["align"]["standard_deviation_scale"],
@@ -171,6 +150,7 @@ int main(int argc, char *argv[]) {
 
   // General
 
+  fs::create_directories(output_path);
   if (do_dump_map) fs::create_directories(output_path / "visual_odometry_maps");
 
   // Generate the geometric map from the pointcloud.
@@ -229,15 +209,27 @@ int main(int argc, char *argv[]) {
 
       if (do_dump_map) {
         dump_map(
-            visual_odometry.map,
-            output_path / fmt::format("visual_odometry_maps/{}", last_keyframe_index));
+            visual_odometry.map, output_path / fmt::format("visual_odometry_maps/{}", last_keyframe_index));
       }
 
       if (do_alignment) {
-        // TODO: Check why optimization costs.
         align(local_to_map_transformation, geometric_map, visual_odometry.map, align_config);
 
         transformations.push_back(local_to_map_transformation);
+
+        //// Do not keep track of transformations but update map iteratively.
+        //// For comparison reasons this does not work.
+        // for (auto &[_, landmark] : visual_odometry.map.landmarks) {
+        //   landmark.position = local_to_map_transformation * landmark.position;
+        // }
+        // for (auto &[_, keyframe] : visual_odometry.map.keyframes) {
+        //   keyframe.pose.translation() = local_to_map_transformation * keyframe.pose.translation();
+        //   keyframe.pose.setRotationMatrix(local_to_map_transformation.rotationMatrix() * keyframe.pose.rotationMatrix());
+        // }
+        // visual_odometry.current_pose.translation() = local_to_map_transformation * visual_odometry.current_pose.translation();
+        // visual_odometry.current_pose.setRotationMatrix(local_to_map_transformation.rotationMatrix() * visual_odometry.current_pose.rotationMatrix());
+        //
+        // local_to_map_transformation = Sophus::Sim3d{Eigen::Matrix4d::Identity()};
       }
 
       if (visual) {
@@ -262,7 +254,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (!success) {
-      std::printf("Failure at frame {}\n", frame_index);
+      fmt::print("Failure at frame {}\n", frame_index);
       if (!success) break;
     }
 
@@ -286,6 +278,9 @@ int main(int argc, char *argv[]) {
     );
     dump_transformations(transformations, output_path / "transformations.csv");
   }
+
+  dump_map(
+      visual_odometry.map, output_path / fmt::format("last_map", last_keyframe_index));
 
   return 0;
 }

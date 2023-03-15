@@ -95,7 +95,7 @@ Sophus::Sim3d alignment(
       options, &problem, &summary
   );
 
-  std::cout << summary.BriefReport() << std::endl;
+  // std::cout << summary.BriefReport() << std::endl;
 
   return transformation;
 }
@@ -109,7 +109,6 @@ struct AlignConfig {
   int max_num_optimization_iterations = 20;
 };
 
-// TODO: Optimize in keyframe frame.
 void align(
     Sophus::Sim3d &local_to_map_transformation,
     const GeometricMap &geometric_map,

@@ -100,7 +100,7 @@ struct VisualOdometryNextReport {
         100.0 * num_landmark_keypoint_inliers / num_visible_landmarks
     );
     fmt::print(
-        "  distance to last keyframeframe: {:.2}, rame: {:.2}\n", distance_to_last_keyframe, distance_to_last_frame
+        "  distance to last keyframe: {:.2}, frame: {:.2}\n", distance_to_last_keyframe, distance_to_last_frame
     );
 
   }
