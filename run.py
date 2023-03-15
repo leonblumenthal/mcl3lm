@@ -1,6 +1,8 @@
 """Run the approach interactively with the vision room 1 easy of the EuRoC dataset.
 
 Hold the spacebar to jump the enxt keyframe.
+
+It is expected that the vision room 1 easy from the EuRoC dataset is in "data/euroc_mav/V1_01_easy".
 """
 
 import argparse
